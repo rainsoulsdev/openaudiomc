@@ -7,6 +7,10 @@ export class MediaEngine {
     // tag -> { count: number, fadeMs: number }
     this._inhibitors = Object.create(null);
     this._areSoundsPlaying = false;
+    // Tracks whether the ambiance channel has received its initial volume state.
+    // Without this, if nothing else is playing on startup the ambiance channel
+    // never gets unmuted because _applyAmbianceState only fires on transitions.
+    this._ambianceInitialized = false;
     this._tickIntervalId = setInterval(() => { try { this._tick(); } catch (e) { /* ignore */ } }, 250);
   }
 
@@ -24,6 +28,11 @@ export class MediaEngine {
   removeChannel(id) {
     const ch = this.channels.get(id);
     if (!ch) return;
+    // If the ambiance channel is being removed, reset the init flag so a
+    // replacement channel gets its volume configured correctly on the next tick.
+    if (ch.tagSet && ((ch.tagSet.has && ch.tagSet.has('AMBIANCE')) || id === 'ambiance-from-account')) {
+      this._ambianceInitialized = false;
+    }
     try {
       // Stop tracks first to avoid late events firing after channel is gone
       Array.from(ch.tracks.values()).forEach((t) => { try { t.stop(); } catch (e) { /* ignore */ } });
@@ -87,8 +96,7 @@ export class MediaEngine {
     this._applyInhibitions();
   }
 
-  // Apply inhibitors to a single channel (used when tags change or new channels are created)
-  _applyInhibitionsFor(ch) {
+  _applyInhibitionsFor(ch, immediate = false) {
     if (!ch) return;
     let total = 0;
     let maxFade = 150;
@@ -106,7 +114,7 @@ export class MediaEngine {
     if (wantsMute && !ch._inhibitorActive) {
       ch._inhibitorActive = true;
       ch._lastInhibitFadeMs = maxFade;
-      ch.fadeCurrentTo(0, maxFade);
+      ch.fadeCurrentTo(0, immediate ? 0 : maxFade);
     } else if (!wantsMute && ch._inhibitorActive) {
       ch._inhibitorActive = false;
       const restoreMs = ch._lastInhibitFadeMs || 150;
@@ -120,7 +128,6 @@ export class MediaEngine {
   }
 
   _tick() {
-    // Determine if any non-ambiance channel has an actively playing track
     let foundPlaying = false;
     Array.from(this.channels.values()).some((ch) => {
       if (ch.tagSet && ch.tagSet.has && ch.tagSet.has('AMBIANCE')) return false;
@@ -132,7 +139,19 @@ export class MediaEngine {
     });
     if (foundPlaying !== this._areSoundsPlaying) {
       this._areSoundsPlaying = foundPlaying;
+      this._ambianceInitialized = true;
       this._applyAmbianceState(foundPlaying);
+    } else if (!this._ambianceInitialized) {
+      // On startup the playing state may never transition (stays false while the
+      // ambiance channel sits muted at 0). Apply the current state once as soon
+      // as we detect an ambiance channel so it unmutes immediately.
+      const hasAmbiance = Array.from(this.channels.values()).some(
+        (ch) => (ch.tagSet && ch.tagSet.has && ch.tagSet.has('AMBIANCE')) || ch.id === 'ambiance-from-account',
+      );
+      if (hasAmbiance) {
+        this._ambianceInitialized = true;
+        this._applyAmbianceState(this._areSoundsPlaying);
+      }
     }
   }
 
